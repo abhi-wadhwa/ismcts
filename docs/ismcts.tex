@@ -1,0 +1,134 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{hyperref}
+
+\newtheorem{definition}{Definition}
+
+\title{Information Set Monte Carlo Tree Search:\\Why Determinization Breaks and How to Fix It}
+\author{Abhi Wadhwa}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+These notes cover Information Set MCTS (IS-MCTS), the algorithm introduced by Cowling, Powley, and Whitehouse in 2012 for search in imperfect-information games. I start with the naive approach---Perfect Information Monte Carlo (PIMC)---and show exactly why it fails via the strategy fusion pathology. Then I walk through how IS-MCTS fixes this by building trees over information sets instead of states, and explain the availability-based UCB modification that makes it all work. I also cover the SO-ISMCTS, MO-ISMCTS, and Smooth UCB variants.
+\end{abstract}
+
+\section{The Problem: Search Under Hidden Information}
+
+In perfect-information games like chess or Go, MCTS works beautifully. You know the full state, you can simulate forward, and UCB handles the exploration-exploitation tradeoff. But in games like poker, Liar's Dice, or any setting where players hold private information, standard MCTS doesn't directly apply---you don't actually know what state you're in.
+
+The most natural first idea is what people call \textbf{determinization} or Perfect Information Monte Carlo (PIMC). The idea is dead simple: sample a concrete world consistent with what you've observed, run standard MCTS on that world as if you could see everything, then repeat many times and average the results. It sounds reasonable. I spent a while trying to figure out why it doesn't work before it clicked.
+
+\section{Strategy Fusion: The Fatal Flaw of Determinization}
+
+The problem has a name: \textbf{strategy fusion}. Here's the cleanest example I know.
+
+Consider a two-step game. A hidden card is dealt, either A or B with equal probability. You can't see it. At step 1, you choose COMMIT or SAFE. SAFE ends the game immediately with payoff $+0.4$. If you chose COMMIT, then at step 2 you pick LEFT or RIGHT. The payoffs are:
+\begin{align*}
+\text{Card A:} \quad &\text{COMMIT} \to \text{LEFT} = +1, \quad \text{COMMIT} \to \text{RIGHT} = -1 \\
+\text{Card B:} \quad &\text{COMMIT} \to \text{LEFT} = -1, \quad \text{COMMIT} \to \text{RIGHT} = +1
+\end{align*}
+
+What's the right play? Well, \textbf{the trick here is} that at step 2, you \emph{still} don't know the card. So after committing, LEFT and RIGHT are effectively a coin flip: expected value $0.5 \cdot (+1) + 0.5 \cdot (-1) = 0$. SAFE gives $+0.4$. So the optimal strategy is SAFE.
+
+Now watch what PIMC does. When it samples world A, it sees COMMIT $\to$ LEFT gives $+1$, which beats SAFE's $+0.4$. When it samples world B, COMMIT $\to$ RIGHT gives $+1$, also beating SAFE. So PIMC concludes: COMMIT is great! Expected value $+1.0$!
+
+But this is nonsense. PIMC is \textbf{fusing} two strategies that require different information. In world A you'd go left, in world B you'd go right, but you can't condition on the world because you can't see the card. The ``averaged'' strategy of COMMIT is actually worth $0.0$, not $+1.0$.
+
+\textbf{The core issue}: determinization lets the simulated agent act on information that the real agent doesn't have. It averages \emph{values} across worlds, but the agent needs a single \emph{strategy} that works across all of them.
+
+\section{Information Sets}
+
+Before diving into the fix, let me define the key concept.
+
+\begin{definition}[Information Set]
+An information set $h$ for player $i$ is the set of all game states that player $i$ cannot distinguish given their observations. Two states are in the same information set if the player has seen the same sequence of public events and their own private information is the same.
+\end{definition}
+
+In poker, for instance, your information set includes your own cards and the history of bets, but not the opponent's cards. Multiple distinct ``worlds'' (different opponent hands) all map to the same information set.
+
+\section{IS-MCTS: Trees Over Information Sets}
+
+Here's the fix from Cowling et al. (2012). Instead of building a tree where each node is a state, we build a tree where \textbf{each node is an information set}. Different determinizations traverse the same tree, and if two determinized states share an information set, they land at the same node and share statistics.
+
+The algorithm for each iteration:
+\begin{enumerate}
+\item Sample a determinization $d$ consistent with current observations.
+\item Descend the tree using the tree policy, but only consider actions that are \emph{legal} in determinization $d$.
+\item When you fall off the tree, expand and run a playout.
+\item Backpropagate the result.
+\end{enumerate}
+
+Notice that the tree is shared across all determinizations. This is what prevents strategy fusion---the step-2 node in our earlier example would be a single information set node visited by both world A and world B, so the algorithm correctly learns that neither LEFT nor RIGHT dominates.
+
+\section{Availability-Based UCB}
+
+Here's a subtlety that I initially overlooked. In standard MCTS, UCB1 uses the parent visit count in the exploration term:
+\[
+\text{UCB}(a) = \frac{Q(a)}{N(a)} + c\sqrt{\frac{\ln N(\text{parent})}{N(a)}}
+\]
+
+But in IS-MCTS, not all actions are legal in every determinization. If action $a$ was only available in 30 out of 100 visits to the parent node, it's unfair to penalize it for not being explored during the other 70 visits. So we replace the parent count with the \textbf{availability count}:
+
+\[
+\boxed{\text{UCB}(a) = \frac{Q(a)}{N(a)} + c\sqrt{\frac{\ln N_{\text{avail}}(a)}{N(a)}}}
+\]
+
+where $N_{\text{avail}}(a)$ counts how many times action $a$ was \emph{legal} when its parent information set was visited. This is a small change in the formula but it's essential---without it, the algorithm heavily over-explores actions that happen to be legal in many determinizations.
+
+\section{SO-ISMCTS: Single Observer}
+
+The full IS-MCTS builds tree structure for every player's decisions, but often we only care about the root player's strategy. \textbf{Single Observer IS-MCTS} (SO-ISMCTS) only builds tree nodes for the root player's information sets. Opponent actions are just sampled uniformly (or from some simple model) without maintaining tree statistics.
+
+This saves a lot of memory and turns out to work surprisingly well in practice. The intuition is that we mostly need good estimates of \emph{our own} action values; we don't need a precise model of what the opponent is doing, just something reasonable enough to evaluate our own choices.
+
+\section{MO-ISMCTS: Multiple Observer}
+
+If you do want better opponent modeling, \textbf{Multiple Observer IS-MCTS} (MO-ISMCTS) maintains a \textbf{separate tree for each player}. When it's player $i$'s turn to act, the algorithm consults player $i$'s tree for the tree policy.
+
+This gives a more realistic simulation of play---each player makes decisions based on their own information set tree---at the cost of maintaining $n$ trees for $n$ players. For two-player games this is usually fine; for many-player games, SO-ISMCTS is often the better choice.
+
+\section{Smooth UCB}
+
+There's one more issue worth discussing. In IS-MCTS, the statistics at a node are aggregated across different determinizations. This means the underlying distribution is \textbf{non-stationary}: as the algorithm explores more, the mix of determinizations passing through a node changes, and the ``true'' value of an action at that node shifts.
+
+Heinrich and Silver (2015) proposed \textbf{Smooth UCB} to handle this. Instead of using the tree policy directly, they mix it with a uniform baseline:
+\[
+\pi_{\text{smooth}}(a) = \eta \cdot \pi_{\text{tree}}(a) + (1 - \eta) \cdot \text{Uniform}(a)
+\]
+where
+\[
+\eta = \max\!\left(0,\; \frac{N - D}{N}\right)
+\]
+and $D$ is a dampening parameter. Early on when $N$ is small, $\eta \approx 0$ and you're basically exploring uniformly. As $N$ grows, $\eta \to 1$ and you trust the tree policy more. The effect is that the algorithm is more robust to the non-stationarity in the early phases of search.
+
+After playing with this for a while, I found that Smooth UCB makes the biggest difference in games with many possible determinizations (like Liar's Dice with many dice), where the non-stationarity is most pronounced. For simpler games like Kuhn Poker, vanilla IS-MCTS already works fine.
+
+\section{Putting It All Together}
+
+To summarize the key relationships:
+
+\begin{itemize}
+\item \textbf{PIMC}: Simple but broken. Suffers from strategy fusion because it lets simulated agents use hidden information.
+\item \textbf{IS-MCTS}: Fixes strategy fusion by building trees over information sets. Requires availability-based UCB.
+\item \textbf{SO-ISMCTS}: Lightweight variant---only one tree for the root player.
+\item \textbf{MO-ISMCTS}: Full variant---separate tree per player, better opponent modeling.
+\item \textbf{Smooth UCB}: Addresses non-stationarity by mixing tree policy with uniform exploration.
+\end{itemize}
+
+It's easy to see that the progression from PIMC to Smooth IS-MCTS follows a natural path: each variant fixes a specific problem with the previous one. The central insight throughout is that \textbf{in imperfect-information games, you must reason about strategies over information sets, not states}. Any algorithm that lets you ``peek'' at hidden information during search will produce strategies that are unachievable in practice.
+
+\begin{thebibliography}{9}
+\bibitem{cowling2012} Cowling, P.I., Powley, E.J., Whitehouse, D. (2012). ``Information Set Monte Carlo Tree Search.'' \textit{IEEE Transactions on Computational Intelligence and AI in Games}, 4(2), 120--143.
+
+\bibitem{frank1998} Frank, I., Basin, D. (1998). ``Search in Games with Incomplete Information: A Case Study Using Bridge Card Play.'' \textit{Artificial Intelligence}, 100(1--2), 87--123.
+
+\bibitem{heinrich2015} Heinrich, J., Silver, D. (2015). ``Smooth UCT Search in Computer Poker.'' \textit{Proceedings of the 24th International Joint Conference on Artificial Intelligence (IJCAI)}.
+
+\bibitem{long2010} Long, J.R., Sturtevant, N.R., Buro, M., Furtak, T. (2010). ``Understanding the Success of Perfect Information Monte Carlo Sampling in Game Tree Search.'' \textit{Proceedings of the 24th AAAI Conference on Artificial Intelligence}.
+\end{thebibliography}
+
+\end{document}
